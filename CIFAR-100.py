@@ -1,19 +1,57 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 """
-CIFAR-100 分类器训练脚本  v3
-date：2026-10-15
+CIFAR-100 分类器训练脚本  v5
+（本文件由同事的 v3.2 合并而来：保留其全部诊断增强，修正 2 处训练行为改动。
+ 版本线按 2026-10-15 约定：代码 v3 → v4（EMA warmup）→ v5（本次合并），
+ 与实验轮次 --tag v5/v6 是两条独立的线。）
+date：2026-10-16
 
-相比于上一版，优化的地方：
-1.微调用小 lr（0.01）+ 弱 wd（1e-4）+ 短周期（100 epoch）+ 2 epoch warmup，避免大 lr 冲掉 ImageNet 特征。
-2.EMA（指数移动平均）​
-已实现且独立追踪：单独评估、单独选最优 epoch、单独存 best_ema.pt，绝不混进 best_val_acc 的口径——保证跨轮可比。
-3.RandomErasing / RandAugment 强增强
+v3.2 相对 v3.1.2（只动诊断与记录，训练数学零改动，跨轮可比性不受影响）：
+  1. launch_cmd（启动命令原样）写入 config.json、控制台头与 report block。
+     教训：88.38 那轮实际开了 --cutmix 1.0，却从未写进任何 header——
+     代码注释是广告，启动命令才是合同。
+  2. 混淆矩阵：best 权重下产出 confusion_matrix.csv（100x100，行=真实列=预测），
+     report block 打印 top-10 最常混淆类对（真→误）。
+  3. AMP 跳步提示阈值化：占比 >1% 才提示（修掉 15/35200=0.04% 也报警的误报）。
+  4. 头部清理：shebang/coding 移到文件头（原 coding 声明在第 14 行无效），
+     合并重复 docstring；补录 revised 中间版未记的改动——run_name 加
+     config hash+时间戳防覆盖、默认 train-per-class 450、训练结束存 last.pt、
+     drop_last=False。（其中 finetune_v1 的 backbone_lr_mult=0.1 已在 v5 移除）
+  5. EMA 步数注释更新：352 step/epoch、100 epoch ≈ 35200 步。
+     【v5 修正】warmup 常数由 100 改回 10，理由见下。
+
+v5（本次合并）相对 v3.2 —— 修正 2 处**会改变训练行为**的改动：
+  A. EMA warmup 常数 100 → 10。C=100 时需 98,900 步（≈281 epoch）才达标称 0.999，
+     本脚本 100 epoch 全程有效 decay 到不了 0.999（末步 0.9972，半衰期 0.70 epoch），
+     EMA≈raw，会抹掉 v4 实测到的 EMA 收益。C=10 时 8,990 步（26% 总步数）达标。
+     ⚠️ 副作用：v5 的 EMA 线与 v4 的 EMA 线**不再跨轮可比**；raw 线不受影响。
+  B. preset finetune_v1 移除 backbone_lr_mult=0.1。差异化 lr 是有待单独验证的杠杆，
+     藏在 preset 里会让每轮 --preset finetune_v1 被静默换配方（重演 cutmix 漏记教训），
+     也与 v5「单变量只加 MixUp」冲突。要用请显式加 --backbone-lr-mult 0.1 开独立轮次。
+
+v3.1.2 相对 v3.1：
+  1. 修复 report 行：源文本被污染成 "\\<换行>"（字符串行延续，等价 ""），
+     导致 report.txt 粘成一行；改为 "\\n" 字面量，真正换行连接。
+     **文件里这行必须保持单行，不要被编辑器自动折行。**
+
+v3.1 相对 v3：
+  1. EMA 引入 warmup decay（(1+step)/(100+step)，常数从 timm 旧版的 10
+     改为 100）。update 只在 optimizer 真实执行时调用（AMP 跳步不计入），
+     与 scheduler.step 语义同步。
+  2. 首次跑通 100 epoch：best_val_acc=88.38% (ep83)，EMA best=88.68% (ep48)。
+     【v3.2 后注】该轮实际配置为等 lr + --cutmix 1.0 + 450/类，header 当时
+     漏记 cutmix，详见当轮归档的 report.txt。
+
+v3 相对 v2：
+  1. 微调用小 lr（0.01）+ 弱 wd（1e-4）+ 短周期（100 epoch）+ 2 epoch warmup。
+  2. EMA 独立追踪，单独评估 / 单独选优 / 单独存 best_ema.pt。
+  3. RandomErasing / RandAugment 强增强。
 """
-
-
-from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import platform
@@ -239,7 +277,7 @@ def rand_bbox(size, lam):
     return x1, y1, x2, y2
 
 
-def apply_mix(images, targets, mixup_alpha, cutmix_alpha, num_classes):
+def apply_mix(images, targets, mixup_alpha, cutmix_alpha):
     """返回 (images, y_a, y_b, lam)。未启用时 lam=1 且 y_b==y_a。"""
     use_mixup = mixup_alpha > 0
     use_cutmix = cutmix_alpha > 0
@@ -336,6 +374,13 @@ def evaluate(model, loader, criterion, device, collect=False, num_classes=NUM_CL
             per_class_correct, per_class_count, out=np.zeros(num_classes), where=per_class_count > 0
         )
         correct_mask = y_true == y_pred
+        # 混淆矩阵（v3.2）：行=真实类，列=预测类。只随 collect 诊断产出，不进训练路径
+        cm = np.zeros((num_classes, num_classes), dtype=np.int64)
+        np.add.at(cm, (y_true, y_pred), 1)
+        off = cm.copy()
+        np.fill_diagonal(off, 0)
+        pairs_idx = np.dstack(np.unravel_index(np.argsort(-off, axis=None), cm.shape))[0]
+        top_conf = [[int(i), int(j), int(cm[i, j])] for i, j in pairs_idx if i != j][:20]
         # 预测分布诊断
         counts = np.bincount(y_pred, minlength=num_classes).astype(np.float64)
         share = counts / counts.sum()
@@ -359,7 +404,9 @@ def evaluate(model, loader, criterion, device, collect=False, num_classes=NUM_CL
             "conf_correct": float(conf[correct_mask].mean()) if correct_mask.any() else float("nan"),
             "conf_wrong": float(conf[~correct_mask].mean()) if (~correct_mask).any() else float("nan"),
             "per_class_acc": cls_acc.tolist(),
+            "top_confusions": top_conf,
         }
+        res["confusion_matrix"] = cm
     return res
 
 
@@ -369,8 +416,15 @@ def evaluate(model, loader, criterion, device, collect=False, num_classes=NUM_CL
 class EMA:
     """权重滑动平均。
 
-    口径：只跟踪浮点张量，因此包含 BN 的 running_mean / running_var
-    （与 timm 的 ModelEma 一致），不含 num_batches_tracked 这类整型 buffer。
+    口径：
+      * 只跟踪浮点张量，因此包含 BN 的 running_mean / running_var，
+        不含 num_batches_tracked 这类整型 buffer。
+      * 采用 warmup decay：(1+step)/(100+step)，timm 早期 ModelEma 的
+        思路（ModelEmaV2 无内置 warmup，需用户传 decay_fn）；常数从 10
+        改为 100，以匹配本脚本 100 epoch ≈ 35200 步的训练周期（352 step/epoch）。
+      * update 只在 optimizer 真实执行时调用（见主循环），AMP 跳步不计入。
+        ema_step 也只在真实更新时递增，warmup 进度与实际更新步数严格对齐。
+
     若日后发现 EMA 权重下的 BN 统计漂移，再改成排除 buffer + 评估前重算 BN。
     apply/restore 自己管好 training flag，调用方不必操心。
     """
@@ -383,10 +437,22 @@ class EMA:
         self.was_training = True
 
     @torch.no_grad()
-    def update(self, model):
+    def update(self, model, step):
+        # 有效 decay：warmup 阶段用 (1+step)/(C+step) 逐步逼近目标 decay，
+        # 避免训练早期 shadow 从"随机初始化的分类头 / 重新初始化的 conv1"起跑而被拖低
+        # （timm ModelEma 的 warmup 思路）。C 的取值必须让 warmup 在训练结束前"跑完"：
+        #   达标称 decay 所需步数 s* 满足 (1+s)/(C+s)=target → s* ≈ (target·C − 1)/(1 − target)
+        #   target=0.999 时：C=10  → s*=8,990 步 ≈ 25.6 epoch（35,200 步的 26%）✅
+        #                    C=100 → s*=98,900 步 ≈ 281 epoch  ❌ 永远跑不完
+        # 若用 C=100，本脚本 100 epoch(35,200 步) 全程的有效 decay 都到不了 0.999：
+        #   末步 decay = 35201/35300 = 0.9972 → 半衰期仅 247 步 ≈ 0.70 epoch，
+        #   比标称 0.999（半衰期 693 步 ≈ 1.97 epoch）短 3 倍，EMA≈raw，会抹掉
+        #   v4 实测到的 EMA 收益（+0.30 / gap 再降 0.85）。
+        # 训练长度大幅变化时同步调 C：经验规则「s* ≈ 总步数的 1/4 ~ 1/3」。
+        decay = min(self.decay, (1.0 + step) / (10.0 + step))
         msd = model.state_dict()
         for k, v in self.shadow.items():
-            v.mul_(self.decay).add_(msd[k].detach(), alpha=1.0 - self.decay)
+            v.mul_(decay).add_(msd[k].detach(), alpha=1.0 - decay)
 
     def apply(self, model):
         self.was_training = model.training
@@ -409,12 +475,12 @@ class EMA:
 # [§6] 参数解析与配方
 # ---------------------------------------------------------------------------
 def get_args():
-    p = argparse.ArgumentParser("CIFAR-100 训练器 v1")
+    p = argparse.ArgumentParser("CIFAR-100 训练器 v3.2")
     # 数据
     p.add_argument("--data", default="./data", help="CIFAR-100 存放/下载目录")
     p.add_argument("--out", default="./runs", help="输出根目录")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--train-per-class", type=int, default=200, help="每类训练图数（默认 200*100=20000）")
+    p.add_argument("--train-per-class", type=int, default=450, help="每类训练图数（默认 450*100=45000）")
     p.add_argument("--val-per-class", type=int, default=50, help="每类内部验证图数（默认 50*100=5000）")
     p.add_argument("--eval-train-clean", type=int, default=2000, help="无增强训练集上评估多少张，用于算真实泛化间隙")
     # 模型
@@ -461,6 +527,11 @@ PRESETS = {
     "scratch_v1": dict(model="resnet18", pretrained="none", epochs=200, bs=128, lr=0.1,
                        wd=5e-4, warmup_epochs=5.0, aug="basic", label_smoothing=0.1),
     # 预训练微调：小 lr（大了会把 ImageNet 特征冲掉）+ 短周期 + 弱权重衰减
+    # 注意：backbone_lr_mult 刻意**不放进** preset。
+    # 差异化 lr（骨干 0.1x / 头部 1x）是一个有待单独验证的杠杆，若藏在 preset 里，
+    # 任何用 --preset finetune_v1 的轮次都会被静默换成另一套优化配方，
+    # 破坏"一次只改一个变量"的归因 —— 这正是 v3 那轮 cutmix 漏记的教训。
+    # 要测它就在命令行显式传 --backbone-lr-mult 0.1，让 recipe 行把它打印出来。
     "finetune_v1": dict(model="resnet50", pretrained="imagenet", epochs=100, bs=128, lr=0.01,
                         wd=1e-4, warmup_epochs=2.0, aug="trivial", label_smoothing=0.1),
 }
@@ -527,6 +598,8 @@ def _validate_args(args):
         (args.input_size >= 16, "input-size 不能小于 16"),
         (args.warmup_epochs >= 0, "warmup-epochs 必须 >= 0"),
         (args.backbone_lr_mult > 0 and args.head_lr_mult > 0, "lr 倍率必须 > 0"),
+        (args.mixup >= 0, "mixup alpha 必须 >= 0"),
+        (args.cutmix >= 0, "cutmix alpha 必须 >= 0"),
     ]
     for ok, msg in checks:
         if not ok:
@@ -535,6 +608,8 @@ def _validate_args(args):
 
 def main():
     args, explicit = resolve_args()
+    # 启动命令原样存档（v3.2 教训）：结果归因只认它，不认代码注释
+    launch_cmd = " ".join([Path(sys.argv[0]).name] + sys.argv[1:])
     set_seed(args.seed)
     if args.deterministic:
         torch.backends.cudnn.benchmark = False
@@ -572,7 +647,7 @@ def main():
 
     pin = device.type == "cuda"
     ld_train = DataLoader(ds_train, batch_size=args.bs, shuffle=True, num_workers=args.workers,
-                          pin_memory=pin, drop_last=True, persistent_workers=args.workers > 0)
+                          pin_memory=pin, drop_last=False, persistent_workers=args.workers > 0)
     ld_val = DataLoader(ds_val, batch_size=256, shuffle=False, num_workers=args.workers, pin_memory=pin)
     ld_clean = DataLoader(ds_clean, batch_size=256, shuffle=False, num_workers=args.workers, pin_memory=pin)
     ld_pool = (DataLoader(ds_pool, batch_size=256, shuffle=False, num_workers=args.workers, pin_memory=pin)
@@ -625,8 +700,23 @@ def main():
     opt_params = [p for g in optimizer.param_groups for p in g["params"]]
 
     # ---------------- 输出目录 ----------------
-    run_name = f"{args.model}_{'pt' if args.pretrained == 'imagenet' else 'scratch'}_{aug_used}" \
-               f"_e{args.epochs}_bs{args.bs}_lr{args.lr}_s{args.seed}"
+    # A run must never overwrite another run's metrics/checkpoints by accident.
+    # The digest distinguishes configurations; timestamp distinguishes repeated runs
+    # with the same configuration (useful for checking seed-to-seed stability).
+    run_signature = {
+        k: v for k, v in vars(args).items()
+        if k not in {"tag"}
+    }
+    config_digest = hashlib.sha1(
+        json.dumps(run_signature, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:8]
+    run_stamp = time.strftime("%Y%m%d-%H%M%S")
+    run_name = (
+        f"{args.model}_{'pt' if args.pretrained == 'imagenet' else 'scratch'}_{aug_used}"
+        f"_n{args.train_per_class}v{args.val_per_class}"
+        f"_e{args.epochs}_bs{args.bs}_lr{args.lr}_s{args.seed}"
+        f"_wd{args.wd}_ls{args.label_smoothing}_{config_digest}_{run_stamp}"
+    )
     if args.mixup > 0:
         run_name += f"_mu{args.mixup}"
     if args.cutmix > 0:
@@ -647,7 +737,9 @@ def main():
         "n_train": len(ds_train), "n_val": len(ds_val),
         "n_pool": (len(ds_pool) if ds_pool is not None else 0),
         "n_clean_eval": len(ds_clean),
+        "train_clean_metric_is_sampled": len(ds_clean) < len(ds_train),
         "explicit_args": sorted(explicit),
+        "launch_cmd": launch_cmd,
         "params": param_count(model),
         "torch": torch.__version__, "torchvision": torchvision.__version__,
         "python": platform.python_version(), "iters_per_epoch": iters_per_epoch,
@@ -658,6 +750,7 @@ def main():
 
     print("=" * 78)
     print(f"RUN: {run_name}   [preset={args.preset}]")
+    print(f"launch_cmd     : {launch_cmd}")
     print(f"数据：train={len(ds_train)}  val={len(ds_val)}  "
           f"pool(未用)={len(ds_pool) if ds_pool is not None else 0}  clean-eval={len(ds_clean)}")
     print(f"切分校验：train∩val={len(set(train_idx) & set(val_idx))}  官方测试集：未加载")
@@ -692,6 +785,7 @@ def main():
     peak_mem = 0.0
     total_bad_grad = 0
     total_skip = 0
+    ema_step = 0  # EMA 真实更新计数（仅 optimizer 真实执行时递增），供 warmup 使用
     last_val_acc = None  # 显式记录"最后一轮的 val"，不依赖循环残留变量
 
     for epoch in range(1, args.epochs + 1):
@@ -707,7 +801,7 @@ def main():
             images = images.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
-            images, y_a, y_b, lam = apply_mix(images, targets, args.mixup, args.cutmix, NUM_CLASSES)
+            images, y_a, y_b, lam = apply_mix(images, targets, args.mixup, args.cutmix)
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=use_amp):
@@ -732,16 +826,21 @@ def main():
             # 发现非有限梯度 → update() 里 scale 减半（且增长计数清零）；
             # 连续正常步满 growth_interval 才 ×2。**同一步不可能既减半又翻倍**，
             # 所以 "scale 变小 ⟺ 本步被跳过" 是精确等价，不是近似。
+            #
+            # scheduler 和 EMA 都放在 if 内、只跟「真实权重更新」对齐：
+            #   - scheduler：跳步时权重没变，LR 不应推进（保持与真实步一致）；
+            #   - EMA：跳步时权重没变，EMA 也不应 decay（否则 EMA 与真实步脱节）；
+            # 两者语义必须同步，否则 LR 与 EMA 会在不同「时间轴」上演进。
             scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
             if scaler.get_scale() >= scale_before:
                 scheduler.step()
+                if ema is not None:
+                    ema.update(model, ema_step)
+                    ema_step += 1
             else:
                 gsteps_skip += 1
-
-            if ema is not None:
-                ema.update(model)
 
             bs = targets.size(0)
             run_loss += loss.item() * bs
@@ -806,6 +905,9 @@ def main():
     fcsv.close()
     total_time = time.time() - t_start
 
+    # Capture actual final-epoch raw weights before diagnostic code loads best checkpoints.
+    last_state = {k: t.detach().cpu().clone() for k, t in model.state_dict().items()}
+
     # ---------------- 用最优权重做最终诊断 ----------------
     def final_diag(state):
         model.load_state_dict(state)
@@ -818,6 +920,7 @@ def main():
 
     v_best, c_best, p_best = final_diag(best_state)
     d = v_best["diag"]
+    cm_best = v_best.pop("confusion_matrix", None)  # 混淆矩阵单独存文件，不进 summary.json
 
     # EMA 权重独立成一份诊断：绝不把 EMA 结果混进 best_val_acc，
     # 否则跨轮次（有的开 EMA 有的不开）就没法横向比较
@@ -852,10 +955,14 @@ def main():
         "config": cfg,
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    # Keep both the validation-selected checkpoint and the actual final-epoch weights.
     if best_state is not None:
         torch.save(best_state, run_dir / "best.pt")
+    torch.save(last_state, run_dir / "last.pt")
     if best_state_ema is not None:
         torch.save(best_state_ema, run_dir / "best_ema.pt")
+    if cm_best is not None:
+        np.savetxt(run_dir / "confusion_matrix.csv", cm_best, fmt="%d", delimiter=",")
 
     # ---------------- 报告块（原样复制粘贴给算法侧） ----------------
     rows = list(csv.reader(open(csv_path, encoding="utf-8")))[1:]
@@ -876,6 +983,7 @@ def main():
              f"aug={aug_used} ls={args.label_smoothing} mixup={args.mixup} "
              f"cutmix={args.cutmix} ema={args.ema} erase={args.erase} dropout={args.dropout}")
     L.append(f"explicit_args   : {','.join(sorted(explicit)) or '(无，全部走 preset/默认)'}")
+    L.append(f"launch_cmd      : {launch_cmd}")
     L.append(f"env             : torch={torch.__version__} tv={torchvision.__version__} "
              f"device={device} amp={use_amp} peak_mem={peak_mem:.2f}GB")
     L.append(f"speed           : total={total_time/60:.1f}min  {summary['img_per_sec']} img/s")
@@ -907,11 +1015,14 @@ def main():
     bc = ", ".join(f"{class_names[i]}={a*100:.0f}%" for i, a in d["cls_acc_best5"])
     L.append(f"最差5类         : {wc}")
     L.append(f"最好5类         : {bc}")
+    tc = ", ".join(f"{class_names[i]}→{class_names[j]}={c}" for i, j, c in d["top_confusions"][:10])
+    L.append(f"最常混淆(真→误) : {tc}")
     L.append(f"预测分布        : 熵={d['mean_entropy']:.3f} 最大类占比={d['pred_max_class_share']*100:.2f}% "
              f"top10覆盖={d['pred_top10_coverage']*100:.1f}% 从未预测的类数={d['never_predicted_classes']}")
     L.append(f"置信度          : 正确样本={d['conf_correct']:.3f}  错误样本={d['conf_wrong']:.3f}")
+    skip_ratio = total_skip / max(1, args.epochs * iters_per_epoch)
     L.append(f"AMP 诊断        : 非有限梯度 {total_bad_grad} 步 | optimizer 实际跳过 {total_skip} 步"
-             + ("（占比高需降 lr 或关 AMP）" if total_skip > 0 else ""))
+             + (f"（占比 {skip_ratio * 100:.2f}%，>1% 需降 lr 或关 AMP）" if skip_ratio > 0.01 else ""))
     L.append("=" * 78)
     L.append(f"完整逐 epoch 日志: {csv_path}")
     L.append(f"完整诊断 json    : {run_dir / 'summary.json'}")
@@ -924,4 +1035,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
