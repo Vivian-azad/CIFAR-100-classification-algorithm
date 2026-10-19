@@ -1,11 +1,20 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-CIFAR-100 分类器训练脚本  v5
+CIFAR-100 分类器训练脚本  v6
 （本文件由同事的 v3.2 合并而来：保留其全部诊断增强，修正 2 处训练行为改动。
- 版本线按 2026-10-15 约定：代码 v3 → v4（EMA warmup）→ v5（本次合并），
- 与实验轮次 --tag v5/v6 是两条独立的线。）
-date：2026-10-16
+ 版本线按 2026-10-15 约定：代码 v3 → v4（EMA warmup）→ v5（v3.2 合并）
+ → v6（本次：加 --init-seed），与实验轮次 --tag v5/v6/v7 是两条独立的线。）
+date：2026-10-16（v6 增补：2026-10-18）
+
+v6 相对 v5 —— 只加一个开关，其余训练行为逐字节不变：
+  新增 `--init-seed`（默认 None = 等于 --seed）。
+  背景：原 --seed 同时控制「数据切分」与「训练随机性」，做集成时换 seed 会连带
+  改变 train/val 划分，导致 ① 三个成员无法在同一 val 上公平评估 ② 某成员的训练集
+  可能含进另一成员的验证集样本（评估虚高）。
+  现在：切分**永远**用 --seed，训练随机性用 --init-seed。
+  集成用法：`--seed 42 --init-seed 42/43/44` —— 切分完全相同、模型彼此不同。
+  不传 --init-seed 时行为与 v5 完全一致，历史结果不受影响。
 
 v3.2 相对 v3.1.2（只动诊断与记录，训练数学零改动，跨轮可比性不受影响）：
   1. launch_cmd（启动命令原样）写入 config.json、控制台头与 report block。
@@ -480,6 +489,12 @@ def get_args():
     p.add_argument("--data", default="./data", help="CIFAR-100 存放/下载目录")
     p.add_argument("--out", default="./runs", help="输出根目录")
     p.add_argument("--seed", type=int, default=42)
+    # 集成专用：只改"训练随机性"（初始化 / shuffle / 增强），**不动数据切分**。
+    # 切分永远用 --seed，所以同一 --seed 下不同 --init-seed 的模型共享完全相同的
+    # train/val 划分 —— 既保证集成可在同一 val 上公平评估，又不会让某个成员的训练集
+    # 含进别的成员的验证集样本（否则评估会虚高）。默认 None = 与 --seed 相同，行为不变。
+    p.add_argument("--init-seed", type=int, default=None,
+                   help="训练随机性种子；默认等于 --seed。集成时固定 --seed 而变它")
     p.add_argument("--train-per-class", type=int, default=450, help="每类训练图数（默认 450*100=45000）")
     p.add_argument("--val-per-class", type=int, default=50, help="每类内部验证图数（默认 50*100=5000）")
     p.add_argument("--eval-train-clean", type=int, default=2000, help="无增强训练集上评估多少张，用于算真实泛化间隙")
@@ -610,7 +625,9 @@ def main():
     args, explicit = resolve_args()
     # 启动命令原样存档（v3.2 教训）：结果归因只认它，不认代码注释
     launch_cmd = " ".join([Path(sys.argv[0]).name] + sys.argv[1:])
-    set_seed(args.seed)
+    # 训练随机性用 init_seed（默认=seed），数据切分始终用 seed（见 stratified_split 调用）
+    init_seed = args.init_seed if args.init_seed is not None else args.seed
+    set_seed(init_seed)
     if args.deterministic:
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
@@ -715,6 +732,7 @@ def main():
         f"{args.model}_{'pt' if args.pretrained == 'imagenet' else 'scratch'}_{aug_used}"
         f"_n{args.train_per_class}v{args.val_per_class}"
         f"_e{args.epochs}_bs{args.bs}_lr{args.lr}_s{args.seed}"
+        f"{'' if init_seed == args.seed else f'_i{init_seed}'}"
         f"_wd{args.wd}_ls{args.label_smoothing}_{config_digest}_{run_stamp}"
     )
     if args.mixup > 0:
